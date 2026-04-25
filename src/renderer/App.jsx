@@ -1,7 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import CharacterConversation from '@/components/CharacterConversation.jsx'
 import CreateAccount from '@/components/CreateAccount.jsx'
+import MatchChat from '@/components/MatchChat.jsx'
+import MatchesScreen from '@/components/MatchesScreen.jsx'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
+import { pickThreeCharacters } from '@/lib/pickCharacters.js'
 
 const WORKER_SPEC = '/workers/main.js'
 const decoder = new TextDecoder('utf-8')
@@ -10,7 +14,11 @@ export default function App() {
   const bridge = window.bridge
   const [profile, setProfile] = useState(undefined)
   const [editing, setEditing] = useState(false)
-  const [title, setTitle] = useState(() => 'v' + bridge.pkg().version)
+  const [screen, setScreen] = useState('home')
+  const [conversationRoster, setConversationRoster] = useState(null)
+  const [matchPeers, setMatchPeers] = useState([])
+  const [blockedPublicIds, setBlockedPublicIds] = useState([])
+  const [dmPeer, setDmPeer] = useState(null)
   const [showUpdate, setShowUpdate] = useState(false)
   const [updating, setUpdating] = useState(false)
 
@@ -22,9 +30,8 @@ export default function App() {
   }, [bridge])
 
   useEffect(() => {
-    const offUpdating = bridge.onPearEvent('updating', () => setTitle('UPDATING...'))
+    const offUpdating = bridge.onPearEvent('updating', () => {})
     const offUpdated = bridge.onPearEvent('updated', () => {
-      setTitle('Update ready!')
       setShowUpdate(true)
     })
     return () => {
@@ -61,14 +68,32 @@ export default function App() {
     }
   }, [bridge, profile])
 
+  useEffect(() => {
+    if (screen !== 'matches' || !profile) return
+    void bridge.blocklistGet().then((r) => {
+      setBlockedPublicIds(Array.isArray(r?.publicIds) ? r.publicIds : [])
+    })
+    bridge.matchmakingStart()
+    const off = bridge.onMatchmakingPeers((payload) => {
+      setMatchPeers(Array.isArray(payload.peers) ? payload.peers : [])
+    })
+    return () => {
+      off()
+      bridge.matchmakingStop()
+      setDmPeer(null)
+    }
+  }, [screen, profile, bridge])
+
   async function onApplyUpdate() {
     setUpdating(true)
     try {
       await bridge.applyUpdate()
       await bridge.appAfterUpdate()
     } catch (err) {
-      setTitle('Update failed: ' + err.message)
       setShowUpdate(false)
+      console.error('Update failed:', err)
+    } finally {
+      setUpdating(false)
     }
   }
 
@@ -76,7 +101,51 @@ export default function App() {
     await bridge.accountClear()
     setProfile(null)
     setEditing(false)
+    setScreen('home')
+    setConversationRoster(null)
+    setMatchPeers([])
+    setBlockedPublicIds([])
+    setDmPeer(null)
   }
+
+  function startConversation() {
+    setConversationRoster(pickThreeCharacters())
+    setScreen('conversation')
+  }
+
+  const openDm = useCallback(
+    async (peer) => {
+      const ok = await bridge.dmOpen(peer.publicId)
+      if (ok) setDmPeer(peer)
+    },
+    [bridge]
+  )
+
+  const detachDmUi = useCallback(() => {
+    setDmPeer(null)
+  }, [])
+
+  const refreshBlocklist = useCallback(async () => {
+    const r = await bridge.blocklistGet()
+    setBlockedPublicIds(Array.isArray(r?.publicIds) ? r.publicIds : [])
+  }, [bridge])
+
+  const blockPeer = useCallback(
+    async (peer) => {
+      await bridge.blocklistAdd(peer.publicId)
+      await refreshBlocklist()
+      setDmPeer((cur) => (cur?.publicId === peer.publicId ? null : cur))
+    },
+    [bridge, refreshBlocklist]
+  )
+
+  const unblockPeer = useCallback(
+    async (publicId) => {
+      await bridge.blocklistRemove(publicId)
+      await refreshBlocklist()
+    },
+    [bridge, refreshBlocklist]
+  )
 
   if (profile === undefined) {
     return (
@@ -93,8 +162,44 @@ export default function App() {
         onComplete={(p) => {
           setProfile(p)
           setEditing(false)
+          setConversationRoster(pickThreeCharacters())
+          setScreen('conversation')
         }}
         onCancel={editing ? () => setEditing(false) : undefined}
+      />
+    )
+  }
+
+  if (screen === 'conversation' && conversationRoster?.length) {
+    return (
+      <CharacterConversation
+        characters={conversationRoster}
+        onBack={() => {
+          setScreen('home')
+          setConversationRoster(null)
+        }}
+        onComplete={() => {
+          setScreen('matches')
+          setConversationRoster(null)
+        }}
+      />
+    )
+  }
+
+  if (screen === 'matches') {
+    if (dmPeer) {
+      return (
+        <MatchChat peer={dmPeer} onClose={detachDmUi} onBlock={() => void blockPeer(dmPeer)} />
+      )
+    }
+    return (
+      <MatchesScreen
+        peers={matchPeers}
+        blockedPublicIds={blockedPublicIds}
+        onBack={() => setScreen('home')}
+        onChatWith={openDm}
+        onBlock={(p) => void blockPeer(p)}
+        onUnblock={(id) => void unblockPeer(id)}
       />
     )
   }
@@ -159,15 +264,26 @@ export default function App() {
           </div>
         </header>
         <Separator className='mb-6' />
-        <div className='flex flex-col items-center text-center'>
-          <h1 className='font-heading text-3xl font-semibold tracking-wide text-foreground md:text-4xl'>
-            {title}
-          </h1>
-          {showUpdate ? (
-            <Button className='mt-4' disabled={updating} onClick={onApplyUpdate}>
+        {showUpdate ? (
+          <div className='mb-6 rounded-lg border border-border bg-card px-4 py-3 text-sm'>
+            <p className='mb-2 text-foreground'>An update is ready to install.</p>
+            <Button size='sm' disabled={updating} onClick={onApplyUpdate}>
               {updating ? 'Updating…' : 'Apply update'}
             </Button>
-          ) : null}
+          </div>
+        ) : null}
+        <div className='flex flex-col gap-3'>
+          <Button
+            type='button'
+            className='w-full sm:w-auto sm:self-start'
+            onClick={startConversation}
+          >
+            Meet 3 people
+          </Button>
+          <p className='max-w-md text-xs text-muted-foreground'>
+            Three random characters each ask one question, then you’ll see who else is online to
+            chat with peer-to-peer.
+          </p>
         </div>
       </div>
     </div>

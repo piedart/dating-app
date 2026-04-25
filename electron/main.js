@@ -5,7 +5,8 @@ const {
   session,
   systemPreferences,
   shell,
-  dialog
+  dialog,
+  Notification
 } = require('electron')
 const crypto = require('crypto')
 const fs = require('fs/promises')
@@ -32,6 +33,69 @@ const appName = productName ?? name
 
 function profilePath() {
   return path.join(app.getPath('userData'), 'dating-profile.json')
+}
+
+function blocklistPath() {
+  return path.join(app.getPath('userData'), 'blocked-peers.json')
+}
+
+let blocklistReady = false
+/** @type {Set<string>} */
+let blockedPublicIds = new Set()
+/** @type {string | null} */
+let rendererDmUiOpenPublicId = null
+/** @type {string | null} */
+let dmActiveRemotePublicId = null
+
+async function ensureBlocklistLoaded() {
+  if (blocklistReady) return
+  blocklistReady = true
+  try {
+    const raw = await fs.readFile(blocklistPath(), 'utf8')
+    const data = JSON.parse(raw)
+    const ids = Array.isArray(data.publicIds) ? data.publicIds : []
+    blockedPublicIds = new Set(ids.map(String))
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err
+    blockedPublicIds = new Set()
+  }
+}
+
+function isBlocked(publicId) {
+  return blockedPublicIds.has(String(publicId))
+}
+
+async function saveBlocklistToDisk() {
+  await fs.mkdir(path.dirname(blocklistPath()), { recursive: true })
+  await fs.writeFile(
+    blocklistPath(),
+    JSON.stringify({ publicIds: [...blockedPublicIds].sort() }, null, 2),
+    'utf8'
+  )
+}
+
+async function clearBlocklist() {
+  blockedPublicIds = new Set()
+  blocklistReady = false
+  try {
+    await fs.unlink(blocklistPath())
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err
+  }
+}
+
+function notifyIncomingDm(fromName, text) {
+  try {
+    if (!Notification.isSupported()) return
+    const title = fromName ? `Message from ${fromName}` : 'New message'
+    const n = new Notification({
+      title,
+      body: String(text).slice(0, 256)
+    })
+    n.show()
+  } catch {
+    /* ignore */
+  }
 }
 
 function requireAnswer(value, label) {
@@ -216,6 +280,216 @@ function sendToAll(name, data) {
   }
 }
 
+const matchTopic = crypto.createHash('sha256').update('hello-pear-electron-matchmaking-v1').digest()
+let matchSwarm = null
+/** @type {Map<string, { publicId: string, displayName: string, username: string }>} */
+const matchPeersByPublicId = new Map()
+/** @type {Map<object, string>} */
+const matchConnToPublicId = new Map()
+
+function matchPeerListForRenderer() {
+  const self = cachedProfile?.publicId
+  const list = []
+  for (const [, p] of matchPeersByPublicId) {
+    if (p.publicId === self) continue
+    if (isBlocked(p.publicId)) continue
+    list.push({
+      publicId: p.publicId,
+      displayName: p.displayName,
+      username: p.username
+    })
+  }
+  return list
+}
+
+function broadcastMatchPeers() {
+  sendToAll('matchmaking:peers', { peers: matchPeerListForRenderer() })
+}
+
+function closeMatchmakingConnectionsTo(publicId) {
+  const pid = String(publicId)
+  for (const [conn, id] of matchConnToPublicId) {
+    if (id === pid) {
+      try {
+        conn.destroy()
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+async function addBlockedPeer(publicId) {
+  await ensureBlocklistLoaded()
+  const pid = String(publicId)
+  if (!/^[a-f0-9]{16}$/i.test(pid)) {
+    throw new Error('Invalid peer id')
+  }
+  blockedPublicIds.add(pid)
+  matchPeersByPublicId.delete(pid)
+  closeMatchmakingConnectionsTo(pid)
+  await saveBlocklistToDisk()
+  broadcastMatchPeers()
+}
+
+async function removeBlockedPeer(publicId) {
+  await ensureBlocklistLoaded()
+  blockedPublicIds.delete(String(publicId))
+  await saveBlocklistToDisk()
+  broadcastMatchPeers()
+}
+
+function stopMatchmaking() {
+  if (!matchSwarm) return
+  matchSwarm.destroy()
+  matchSwarm = null
+  matchPeersByPublicId.clear()
+  matchConnToPublicId.clear()
+  broadcastMatchPeers()
+}
+
+function startMatchmaking() {
+  if (!cachedProfile || matchSwarm) return
+  matchSwarm = new Hyperswarm()
+  matchSwarm.on('connection', (conn) => {
+    const line =
+      JSON.stringify({
+        type: 'hello',
+        publicId: cachedProfile.publicId,
+        displayName: cachedProfile.displayName,
+        username: cachedProfile.username
+      }) + '\n'
+    conn.write(line)
+
+    let buf = ''
+    conn.on('data', (chunk) => {
+      buf += chunk.toString('utf8')
+      let i
+      while ((i = buf.indexOf('\n')) !== -1) {
+        const raw = buf.slice(0, i)
+        buf = buf.slice(i + 1)
+        if (!raw) continue
+        try {
+          const msg = JSON.parse(raw)
+          if (msg.type === 'hello' && typeof msg.publicId === 'string') {
+            if (isBlocked(msg.publicId)) {
+              try {
+                conn.destroy()
+              } catch {
+                /* ignore */
+              }
+              return
+            }
+            const prev = matchConnToPublicId.get(conn)
+            if (prev && prev !== msg.publicId) {
+              matchPeersByPublicId.delete(prev)
+            }
+            matchConnToPublicId.set(conn, msg.publicId)
+            matchPeersByPublicId.set(msg.publicId, {
+              publicId: msg.publicId,
+              displayName: String(msg.displayName ?? '').slice(0, 80),
+              username: String(msg.username ?? '').slice(0, 32)
+            })
+            broadcastMatchPeers()
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    })
+    conn.on('close', () => {
+      const pid = matchConnToPublicId.get(conn)
+      matchConnToPublicId.delete(conn)
+      if (pid) {
+        matchPeersByPublicId.delete(pid)
+        broadcastMatchPeers()
+      }
+    })
+  })
+  matchSwarm.on('update', broadcastMatchPeers)
+  matchSwarm.join(matchTopic, { client: true, server: true })
+  broadcastMatchPeers()
+}
+
+let dmSwarm = null
+const dmSockets = new Set()
+const localDmWireId = crypto.randomBytes(4).toString('hex')
+
+function stopDmChat() {
+  if (!dmSwarm) return
+  dmSwarm.destroy()
+  dmSwarm = null
+  dmSockets.clear()
+  dmActiveRemotePublicId = null
+  rendererDmUiOpenPublicId = null
+  sendToAll('dm:closed', {})
+}
+
+function dmBroadcastLine(payload) {
+  const line = JSON.stringify(payload) + '\n'
+  for (const c of dmSockets) {
+    if (!c.destroyed) c.write(line)
+  }
+}
+
+function startDmChat(remotePublicId) {
+  if (!cachedProfile || !remotePublicId) return false
+  const b = String(remotePublicId)
+  if (isBlocked(b)) return false
+  if (dmSwarm && dmActiveRemotePublicId === b) {
+    return true
+  }
+  stopDmChat()
+  dmActiveRemotePublicId = b
+  const a = String(cachedProfile.publicId)
+  const topicKey = [a, b].sort().join(':')
+  const topic = crypto
+    .createHash('sha256')
+    .update('hello-pear-electron-dm:' + topicKey)
+    .digest()
+  dmSwarm = new Hyperswarm()
+  dmSwarm.on('connection', (conn) => {
+    dmSockets.add(conn)
+    let buf = ''
+    conn.on('data', (chunk) => {
+      buf += chunk.toString('utf8')
+      let i
+      while ((i = buf.indexOf('\n')) !== -1) {
+        const raw = buf.slice(0, i)
+        buf = buf.slice(i + 1)
+        if (!raw) continue
+        try {
+          const msg = JSON.parse(raw)
+          if (typeof msg.text === 'string' && typeof msg.from === 'string') {
+            const peerPublicId = typeof msg.publicId === 'string' ? msg.publicId : undefined
+            if (peerPublicId && isBlocked(peerPublicId)) {
+              continue
+            }
+            const name = typeof msg.name === 'string' ? msg.name.slice(0, 80) : undefined
+            const out = {
+              text: msg.text,
+              from: msg.from,
+              name,
+              publicId: peerPublicId
+            }
+            sendToAll('dm:message', out)
+            if (peerPublicId && peerPublicId !== rendererDmUiOpenPublicId) {
+              notifyIncomingDm(name, msg.text)
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    })
+    conn.on('close', () => {
+      dmSockets.delete(conn)
+    })
+  })
+  dmSwarm.join(topic, { client: true, server: true })
+  return true
+}
+
 function getWorker(specifier) {
   if (workers.has(specifier)) return workers.get(specifier)
   const pear = getPear()
@@ -266,9 +540,14 @@ async function openMicrophonePrivacyPane() {
   return { ok: false }
 }
 
+function microphoneSettingsAppName() {
+  return app.isPackaged ? appName : 'Electron'
+}
+
 async function promptMicrophonePrivacy(evt) {
   const win = BrowserWindow.fromWebContents(evt.sender)
   const parent = win && !win.isDestroyed() ? win : undefined
+  const listName = microphoneSettingsAppName()
   if (process.platform === 'darwin') {
     const { response } = await dialog.showMessageBox(parent, {
       type: 'info',
@@ -277,7 +556,9 @@ async function promptMicrophonePrivacy(evt) {
       cancelId: 1,
       title: 'Microphone access',
       message: 'Microphone is turned off for this app.',
-      detail: `In the list, turn on the switch for ${appName} or for Electron while developing. Then fully quit and reopen the app before recording again.`
+      detail: app.isPackaged
+        ? `In Privacy & Security → Microphone, turn on the switch for ${listName}. Then fully quit and reopen the app before recording again.`
+        : `While developing, macOS lists this app as Electron (not "${appName}"). Turn on its microphone switch, then fully quit and reopen this window before recording again.`
     })
     if (response === 0) {
       await openMicrophonePrivacyPane()
@@ -308,25 +589,39 @@ async function ensureMicrophoneForCapture() {
   if (process.platform !== 'darwin') {
     return { ok: true }
   }
-  const status = systemPreferences.getMediaAccessStatus('microphone')
+  let status = systemPreferences.getMediaAccessStatus('microphone')
   if (status === 'granted') {
     return { ok: true }
   }
-  if (status === 'denied' || status === 'restricted') {
+  if (status === 'restricted') {
     return {
       ok: false,
       message:
-        'Microphone is off for this app. Use “Open System Settings” below (or the button in the dialog) to enable Hello Pear or Electron, then quit and reopen the app.'
+        'Microphone is restricted on this Mac (for example by a management profile). You may need an administrator to allow access.'
     }
   }
+
+  // Must call this for macOS to add the app to Privacy → Microphone. Do not bail early on
+  // "denied" — status can be wrong before the first real prompt, and skipping askForMediaAccess
+  // leaves the app missing from the list entirely.
   const granted = await systemPreferences.askForMediaAccess('microphone')
   if (granted) {
     return { ok: true }
   }
+
+  status = systemPreferences.getMediaAccessStatus('microphone')
+  const listName = microphoneSettingsAppName()
+  if (status === 'denied') {
+    return {
+      ok: false,
+      message: app.isPackaged
+        ? `Microphone is off for ${listName}. Open System Settings → Privacy & Security → Microphone, turn on ${listName}, then quit and reopen the app.`
+        : `Microphone is off for ${listName}. In System Settings → Privacy & Security → Microphone, find Electron (the dev runtime, not "${appName}"), turn it on, then quit and reopen this app.`
+    }
+  }
   return {
     ok: false,
-    message:
-      'Microphone access was not granted. You can open System Settings from the dialog or the button below.'
+    message: `Microphone access was not granted. Check Privacy & Security → Microphone for ${listName}, or use the button below to open settings.`
   }
 }
 
@@ -336,7 +631,9 @@ async function createWindow() {
     height: 820,
     webPreferences: {
       preload: path.join(__dirname, '..', 'electron', 'preload.js'),
-      sandbox: true,
+      // Sandboxed renderers often fail to register with macOS microphone privacy; the app never
+      // appears under Privacy → Microphone until this matches how most Electron media apps run.
+      sandbox: false,
       nodeIntegration: false,
       contextIsolation: true
     }
@@ -377,6 +674,63 @@ ipcMain.handle('media:requestMicrophone', () => ensureMicrophoneForCapture())
 ipcMain.handle('media:openMicrophonePrivacy', openMicrophonePrivacyPane)
 ipcMain.handle('media:promptMicrophonePrivacy', (evt) => promptMicrophonePrivacy(evt))
 
+ipcMain.handle('matchmaking:start', async () => {
+  await ensureBlocklistLoaded()
+  startMatchmaking()
+  return true
+})
+ipcMain.handle('matchmaking:stop', () => {
+  stopMatchmaking()
+  return true
+})
+ipcMain.handle('dm:open', (_, remotePublicId) => startDmChat(remotePublicId))
+ipcMain.handle('dm:send', (_, text) => {
+  const t = String(text ?? '')
+    .replace(/\r?\n/g, ' ')
+    .trim()
+    .slice(0, 2000)
+  if (!t || !dmSwarm) return false
+  const name =
+    typeof cachedProfile?.displayName === 'string'
+      ? String(cachedProfile.displayName).slice(0, 80)
+      : typeof cachedProfile?.username === 'string'
+        ? String(cachedProfile.username).slice(0, 80)
+        : undefined
+  const payload = {
+    from: localDmWireId,
+    publicId: String(cachedProfile.publicId),
+    text: t,
+    name
+  }
+  dmBroadcastLine(payload)
+  sendToAll('dm:message', { ...payload, self: true })
+  return true
+})
+ipcMain.handle('dm:close', () => {
+  stopDmChat()
+  return true
+})
+ipcMain.handle('dm:uiState', (_, openWithPublicId) => {
+  rendererDmUiOpenPublicId =
+    typeof openWithPublicId === 'string' && openWithPublicId ? openWithPublicId : null
+  return true
+})
+ipcMain.handle('blocklist:get', async () => {
+  await ensureBlocklistLoaded()
+  return { publicIds: [...blockedPublicIds].sort() }
+})
+ipcMain.handle('blocklist:add', async (_, publicId) => {
+  await addBlockedPeer(publicId)
+  if (dmActiveRemotePublicId === String(publicId)) {
+    stopDmChat()
+  }
+  return true
+})
+ipcMain.handle('blocklist:remove', async (_, publicId) => {
+  await removeBlockedPeer(publicId)
+  return true
+})
+
 ipcMain.handle('account:get', async () => {
   try {
     const raw = await fs.readFile(profilePath(), 'utf8')
@@ -386,6 +740,7 @@ ipcMain.handle('account:get', async () => {
       return null
     }
     cachedProfile = parsed
+    await ensureBlocklistLoaded()
     return cachedProfile
   } catch (err) {
     if (err.code === 'ENOENT') {
@@ -406,6 +761,9 @@ ipcMain.handle('account:save', async (_evt, profile) => {
 
 ipcMain.handle('account:clear', async () => {
   cachedProfile = null
+  stopMatchmaking()
+  stopDmChat()
+  await clearBlocklist()
   try {
     await fs.unlink(profilePath())
   } catch (err) {
@@ -458,6 +816,7 @@ if (!lock) {
   })
 
   app.whenReady().then(() => {
+    ensureBlocklistLoaded().catch((err) => console.error('blocklist load:', err))
     session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
       if (permission === 'microphone' || permission === 'media') {
         callback(true)
@@ -488,5 +847,10 @@ if (!lock) {
     if (process.platform !== 'darwin') {
       app.quit()
     }
+  })
+
+  app.on('before-quit', () => {
+    stopMatchmaking()
+    stopDmChat()
   })
 }

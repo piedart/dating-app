@@ -21,6 +21,9 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    strictPort: false
+    strictPort: false,
+    fs: {
+      allow: [path.join(__dirname, 'src'), path.join(__dirname, 'data')]
+    }
   }
 })

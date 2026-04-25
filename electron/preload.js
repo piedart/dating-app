@@ -40,5 +40,29 @@ contextBridge.exposeInMainWorld('bridge', {
   promptMicrophonePrivacy: () => ipcRenderer.invoke('media:promptMicrophonePrivacy'),
   accountGet: () => ipcRenderer.invoke('account:get'),
   accountSave: (profile) => ipcRenderer.invoke('account:save', profile),
-  accountClear: () => ipcRenderer.invoke('account:clear')
+  accountClear: () => ipcRenderer.invoke('account:clear'),
+  matchmakingStart: () => ipcRenderer.invoke('matchmaking:start'),
+  matchmakingStop: () => ipcRenderer.invoke('matchmaking:stop'),
+  onMatchmakingPeers: (listener) => {
+    const wrap = (_evt, data) => listener(data)
+    ipcRenderer.on('matchmaking:peers', wrap)
+    return () => ipcRenderer.removeListener('matchmaking:peers', wrap)
+  },
+  dmOpen: (remotePublicId) => ipcRenderer.invoke('dm:open', remotePublicId),
+  dmSend: (text) => ipcRenderer.invoke('dm:send', text),
+  dmClose: () => ipcRenderer.invoke('dm:close'),
+  dmSetUiState: (openWithPublicId) => ipcRenderer.invoke('dm:uiState', openWithPublicId),
+  blocklistGet: () => ipcRenderer.invoke('blocklist:get'),
+  blocklistAdd: (publicId) => ipcRenderer.invoke('blocklist:add', publicId),
+  blocklistRemove: (publicId) => ipcRenderer.invoke('blocklist:remove', publicId),
+  onDmMessage: (listener) => {
+    const wrap = (_evt, msg) => listener(msg)
+    ipcRenderer.on('dm:message', wrap)
+    return () => ipcRenderer.removeListener('dm:message', wrap)
+  },
+  onDmClosed: (listener) => {
+    const wrap = () => listener()
+    ipcRenderer.on('dm:closed', wrap)
+    return () => ipcRenderer.removeListener('dm:closed', wrap)
+  }
 })

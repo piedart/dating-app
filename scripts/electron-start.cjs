@@ -18,8 +18,16 @@ if (build.status !== 0) {
 const env = { ...process.env }
 delete env.PEAR_DEV_SERVER_URL
 
-const forgeBin = path.join(root, 'node_modules', '.bin', 'electron-forge')
-const electron = spawn(forgeBin, ['start', '--', '--no-updates', ...extra], {
+// Windows has no extensionless shim in .bin; run the CLI entry with node (same idea as vite above).
+const forgeCli = path.join(
+  root,
+  'node_modules',
+  '@electron-forge',
+  'cli',
+  'dist',
+  'electron-forge.js'
+)
+const electron = spawn(process.execPath, [forgeCli, 'start', '--', '--no-updates', ...extra], {
   stdio: 'inherit',
   cwd: root,
   env

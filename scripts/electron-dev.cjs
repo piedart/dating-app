@@ -69,8 +69,15 @@ async function main() {
     throw err
   }
 
-  const forgeBin = path.join(root, 'node_modules', '.bin', 'electron-forge')
-  const electron = spawn(forgeBin, ['start', '--', '--no-updates', ...extra], {
+  const forgeCli = path.join(
+    root,
+    'node_modules',
+    '@electron-forge',
+    'cli',
+    'dist',
+    'electron-forge.js'
+  )
+  const electron = spawn(process.execPath, [forgeCli, 'start', '--', '--no-updates', ...extra], {
     stdio: 'inherit',
     cwd: root,
     env: { ...process.env, PEAR_DEV_SERVER_URL: url }

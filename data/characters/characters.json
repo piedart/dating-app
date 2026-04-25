@@ -1,0 +1,44 @@
+[
+  {
+    "id": "marisol",
+    "name": "Marisol",
+    "tagline": "Night-shift barista who reads too much fiction",
+    "emoji": "☕",
+    "questions": ["Be honest—are you actually a morning person or is that just bio padding?"]
+  },
+  {
+    "id": "theo",
+    "name": "Theo",
+    "tagline": "Ex-tour guide, current overthinker",
+    "emoji": "🧭",
+    "questions": ["Plane, train, or road trip—pick one and defend it like your life depends on it."]
+  },
+  {
+    "id": "jun",
+    "name": "Jun",
+    "tagline": "Software is fine; people are the bug",
+    "emoji": "💻",
+    "questions": ["What’s a tool or app you’d riot if they killed it tomorrow?"]
+  },
+  {
+    "id": "rita",
+    "name": "Rita",
+    "tagline": "Auntie energy, zero biological kids",
+    "emoji": "🎧",
+    "questions": ["What song have you played on repeat until you hated yourself a little?"]
+  },
+  {
+    "id": "eli",
+    "name": "Eli",
+    "tagline": "Indoor kid who still owns hiking boots",
+    "emoji": "🌲",
+    "questions": ["Nature: recharge or ‘nice on Instagram, exhausting in person’?"]
+  },
+  {
+    "id": "naya",
+    "name": "Naya",
+    "tagline": "Chaos chef, occasional adult",
+    "emoji": "🍳",
+    "questions": ["What’s your death-row meal, but make it emotionally honest?"]
+  }
+]
