@@ -27,7 +27,11 @@ function getWindowsKitVersion() {
 let packagerConfig = {
   icon: 'build/icon',
   protocols: [{ name: appName, schemes: [pkg.name] }],
-  derefSymlinks: true
+  derefSymlinks: true,
+  extendInfo: {
+    NSMicrophoneUsageDescription:
+      'Hello Pear needs the microphone to record a short bird sound for your profile.'
+  }
 }
 
 if (process.env.MAC_CODESIGN_IDENTITY) {

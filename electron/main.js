@@ -1,5 +1,14 @@
-const { app, BrowserWindow, ipcMain } = require('electron')
+const {
+  app,
+  BrowserWindow,
+  ipcMain,
+  session,
+  systemPreferences,
+  shell,
+  dialog
+} = require('electron')
 const crypto = require('crypto')
+const fs = require('fs/promises')
 const os = require('os')
 const path = require('path')
 const Hyperswarm = require('hyperswarm')
@@ -16,12 +25,125 @@ const protocol = name
 const workers = new Map()
 let pear = null
 
-const localChatId = crypto.randomBytes(4).toString('hex')
-const devChatTopic = crypto.createHash('sha256').update('hello-pear-electron-dev-chat').digest()
-let chatSwarm = null
-const chatSockets = new Set()
+/** @type {Record<string, unknown> | null} */
+let cachedProfile = null
 
 const appName = productName ?? name
+
+function profilePath() {
+  return path.join(app.getPath('userData'), 'dating-profile.json')
+}
+
+function requireAnswer(value, label) {
+  const s = String(value ?? '')
+    .trim()
+    .slice(0, 120)
+  if (!s) {
+    throw new Error(`${label} is required`)
+  }
+  return s
+}
+
+const MAX_DOODLE_DATA_URL = 520_000
+const MAX_BIRD_DATA_URL = 1_200_000
+
+function validateDataUrl(value, label, prefix, maxLen) {
+  const s = String(value ?? '').trim()
+  if (!s.startsWith(prefix)) {
+    throw new Error(`${label} is required`)
+  }
+  if (s.length > maxLen) {
+    throw new Error(`${label} is too large — try a simpler drawing or shorter clip`)
+  }
+  return s
+}
+
+function isStoredProfileComplete(p) {
+  if (!p || typeof p !== 'object') return false
+  const u = String(p.username ?? '')
+    .trim()
+    .toLowerCase()
+  if (!/^[a-z0-9_]{3,32}$/.test(u)) return false
+  if (!String(p.displayName ?? '').trim()) return false
+  const age = Number(p.age)
+  if (!Number.isFinite(age) || age < 18 || age > 120) return false
+  if (!String(p.gender ?? '').trim()) return false
+  const doodle = String(p.doodlePng ?? '').trim()
+  if (!doodle.startsWith('data:image/png') || doodle.length < 200) return false
+  const bird = String(p.birdSound ?? '').trim()
+  if (!bird.startsWith('data:audio') || bird.length < 80) return false
+  if (!String(p.favouriteCar ?? '').trim()) return false
+  return true
+}
+
+function validateProfile(input) {
+  const usernameRaw = String(input?.username ?? '')
+    .trim()
+    .toLowerCase()
+  if (!/^[a-z0-9_]{3,32}$/.test(usernameRaw)) {
+    throw new Error('Username must be 3–32 characters (letters, numbers, underscores)')
+  }
+
+  const displayName = String(input?.displayName ?? '')
+    .trim()
+    .slice(0, 80)
+  if (!displayName) {
+    throw new Error('Display name is required')
+  }
+
+  const age = Number(input?.age)
+  const ageNum = Number.isFinite(age) && age >= 18 && age <= 120 ? Math.floor(age) : null
+  if (ageNum === null) {
+    throw new Error('Enter a valid age between 18 and 120')
+  }
+
+  const gender = requireAnswer(input?.gender, 'Gender').slice(0, 40)
+
+  const city = String(input?.city ?? '')
+    .trim()
+    .slice(0, 80)
+  const pronouns = String(input?.pronouns ?? '')
+    .trim()
+    .slice(0, 40)
+  const bio = String(input?.bio ?? '')
+    .trim()
+    .slice(0, 500)
+
+  const doodlePng = validateDataUrl(
+    input?.doodlePng,
+    'Drawing',
+    'data:image/png',
+    MAX_DOODLE_DATA_URL
+  )
+  const birdSound = validateDataUrl(input?.birdSound, 'Bird sound', 'data:audio', MAX_BIRD_DATA_URL)
+  const favouriteCar = requireAnswer(input?.favouriteCar, 'Favourite car')
+
+  const existingPid = input?.publicId
+  const publicId =
+    typeof existingPid === 'string' && /^[a-f0-9]{16}$/i.test(existingPid)
+      ? existingPid
+      : crypto.randomBytes(8).toString('hex')
+
+  const createdAt =
+    typeof input?.createdAt === 'string' && input.createdAt
+      ? input.createdAt
+      : new Date().toISOString()
+
+  return {
+    publicId,
+    username: usernameRaw,
+    displayName,
+    age: ageNum,
+    gender,
+    city: city || undefined,
+    pronouns: pronouns || undefined,
+    bio: bio || undefined,
+    doodlePng,
+    birdSound,
+    favouriteCar,
+    createdAt
+  }
+}
 
 const cmd = command(
   appName,
@@ -94,52 +216,6 @@ function sendToAll(name, data) {
   }
 }
 
-function sendChatPeerCount() {
-  sendToAll('p2p-chat:peers', { count: chatSockets.size, id: localChatId })
-}
-
-function broadcastChatLine(payload) {
-  const line = JSON.stringify(payload) + '\n'
-  for (const conn of chatSockets) {
-    if (!conn.destroyed) conn.write(line)
-  }
-}
-
-function startDevChat() {
-  if (chatSwarm) return
-  chatSwarm = new Hyperswarm()
-  chatSwarm.on('connection', (conn) => {
-    chatSockets.add(conn)
-    sendChatPeerCount()
-    let buf = ''
-    conn.on('data', (chunk) => {
-      buf += chunk.toString('utf8')
-      let i
-      while ((i = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, i)
-        buf = buf.slice(i + 1)
-        if (!line) continue
-        try {
-          const msg = JSON.parse(line)
-          if (typeof msg.text === 'string' && typeof msg.from === 'string') {
-            sendToAll('p2p-chat:message', { text: msg.text, from: msg.from })
-          }
-        } catch {
-          /* ignore malformed line */
-        }
-      }
-    })
-    conn.on('close', () => {
-      chatSockets.delete(conn)
-      sendChatPeerCount()
-    })
-  })
-  chatSwarm.on('update', sendChatPeerCount)
-  const discovery = chatSwarm.join(devChatTopic, { server: true, client: true })
-  discovery.flushed().then(sendChatPeerCount).catch(sendChatPeerCount)
-  sendChatPeerCount()
-}
-
 function getWorker(specifier) {
   if (workers.has(specifier)) return workers.get(specifier)
   const pear = getPear()
@@ -176,10 +252,88 @@ function getWorker(specifier) {
   return worker
 }
 
+const MACOS_MIC_PREFS = 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
+
+async function openMicrophonePrivacyPane() {
+  if (process.platform === 'darwin') {
+    await shell.openExternal(MACOS_MIC_PREFS)
+    return { ok: true }
+  }
+  if (process.platform === 'win32') {
+    await shell.openExternal('ms-settings:privacy-microphone')
+    return { ok: true }
+  }
+  return { ok: false }
+}
+
+async function promptMicrophonePrivacy(evt) {
+  const win = BrowserWindow.fromWebContents(evt.sender)
+  const parent = win && !win.isDestroyed() ? win : undefined
+  if (process.platform === 'darwin') {
+    const { response } = await dialog.showMessageBox(parent, {
+      type: 'info',
+      buttons: ['Open System Settings', 'Not now'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Microphone access',
+      message: 'Microphone is turned off for this app.',
+      detail: `In the list, turn on the switch for ${appName} or for Electron while developing. Then fully quit and reopen the app before recording again.`
+    })
+    if (response === 0) {
+      await openMicrophonePrivacyPane()
+      return { opened: true }
+    }
+    return { opened: false }
+  }
+  if (process.platform === 'win32') {
+    const { response } = await dialog.showMessageBox(parent, {
+      type: 'info',
+      buttons: ['Open microphone privacy', 'Not now'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Microphone access',
+      message: 'Windows may be blocking the microphone for this app.',
+      detail: 'Allow microphone access for this app, then try recording again.'
+    })
+    if (response === 0) {
+      await openMicrophonePrivacyPane()
+      return { opened: true }
+    }
+    return { opened: false }
+  }
+  return { opened: false }
+}
+
+async function ensureMicrophoneForCapture() {
+  if (process.platform !== 'darwin') {
+    return { ok: true }
+  }
+  const status = systemPreferences.getMediaAccessStatus('microphone')
+  if (status === 'granted') {
+    return { ok: true }
+  }
+  if (status === 'denied' || status === 'restricted') {
+    return {
+      ok: false,
+      message:
+        'Microphone is off for this app. Use “Open System Settings” below (or the button in the dialog) to enable Hello Pear or Electron, then quit and reopen the app.'
+    }
+  }
+  const granted = await systemPreferences.askForMediaAccess('microphone')
+  if (granted) {
+    return { ok: true }
+  }
+  return {
+    ok: false,
+    message:
+      'Microphone access was not granted. You can open System Settings from the dialog or the button below.'
+  }
+}
+
 async function createWindow() {
   const win = new BrowserWindow({
-    width: 800,
-    height: 720,
+    width: 880,
+    height: 820,
     webPreferences: {
       preload: path.join(__dirname, '..', 'electron', 'preload.js'),
       sandbox: true,
@@ -219,15 +373,44 @@ async function createWindow() {
   await win.loadFile(path.join(__dirname, '..', 'dist', 'renderer', 'index.html'))
 }
 
-ipcMain.handle('p2p-chat:send', (_, text) => {
-  const t = String(text ?? '')
-    .replace(/\r?\n/g, ' ')
-    .trim()
-    .slice(0, 2000)
-  if (!t) return false
-  broadcastChatLine({ from: localChatId, text: t })
-  sendToAll('p2p-chat:message', { from: localChatId, text: t, self: true })
-  return true
+ipcMain.handle('media:requestMicrophone', () => ensureMicrophoneForCapture())
+ipcMain.handle('media:openMicrophonePrivacy', openMicrophonePrivacyPane)
+ipcMain.handle('media:promptMicrophonePrivacy', (evt) => promptMicrophonePrivacy(evt))
+
+ipcMain.handle('account:get', async () => {
+  try {
+    const raw = await fs.readFile(profilePath(), 'utf8')
+    const parsed = JSON.parse(raw)
+    if (!isStoredProfileComplete(parsed)) {
+      cachedProfile = null
+      return null
+    }
+    cachedProfile = parsed
+    return cachedProfile
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      cachedProfile = null
+      return null
+    }
+    throw err
+  }
+})
+
+ipcMain.handle('account:save', async (_evt, profile) => {
+  const sanitized = validateProfile(profile)
+  await fs.mkdir(path.dirname(profilePath()), { recursive: true })
+  await fs.writeFile(profilePath(), JSON.stringify(sanitized, null, 2), 'utf8')
+  cachedProfile = sanitized
+  return sanitized
+})
+
+ipcMain.handle('account:clear', async () => {
+  cachedProfile = null
+  try {
+    await fs.unlink(profilePath())
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err
+  }
 })
 
 ipcMain.handle('pear:applyUpdate', () => {
@@ -275,7 +458,18 @@ if (!lock) {
   })
 
   app.whenReady().then(() => {
-    startDevChat()
+    session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+      if (permission === 'microphone' || permission === 'media') {
+        callback(true)
+      } else {
+        callback(false)
+      }
+    })
+    session.defaultSession.setPermissionCheckHandler((_wc, permission) => {
+      if (permission === 'microphone' || permission === 'media') {
+        return true
+      }
+    })
     createWindow().catch((err) => {
       console.error('Failed to create window:', err)
       app.quit()
@@ -293,14 +487,6 @@ if (!lock) {
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') {
       app.quit()
-    }
-  })
-
-  app.on('before-quit', () => {
-    if (chatSwarm) {
-      chatSwarm.destroy()
-      chatSwarm = null
-      chatSockets.clear()
     }
   })
 }

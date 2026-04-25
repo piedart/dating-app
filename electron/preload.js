@@ -1,5 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron')
 contextBridge.exposeInMainWorld('bridge', {
+  platform: process.platform,
   pkg() {
     return ipcRenderer.sendSync('pkg')
   },
@@ -34,15 +35,10 @@ contextBridge.exposeInMainWorld('bridge', {
   writeWorkerIPC: (specifier, data) => {
     return ipcRenderer.invoke('pear:worker:writeIPC:' + specifier, data)
   },
-  chatSend: (text) => ipcRenderer.invoke('p2p-chat:send', text),
-  onChatMessage: (listener) => {
-    const wrap = (_evt, msg) => listener(msg)
-    ipcRenderer.on('p2p-chat:message', wrap)
-    return () => ipcRenderer.removeListener('p2p-chat:message', wrap)
-  },
-  onChatPeers: (listener) => {
-    const wrap = (_evt, data) => listener(data)
-    ipcRenderer.on('p2p-chat:peers', wrap)
-    return () => ipcRenderer.removeListener('p2p-chat:peers', wrap)
-  }
+  requestMicrophone: () => ipcRenderer.invoke('media:requestMicrophone'),
+  openMicrophonePrivacy: () => ipcRenderer.invoke('media:openMicrophonePrivacy'),
+  promptMicrophonePrivacy: () => ipcRenderer.invoke('media:promptMicrophonePrivacy'),
+  accountGet: () => ipcRenderer.invoke('account:get'),
+  accountSave: (profile) => ipcRenderer.invoke('account:save', profile),
+  accountClear: () => ipcRenderer.invoke('account:clear')
 })
